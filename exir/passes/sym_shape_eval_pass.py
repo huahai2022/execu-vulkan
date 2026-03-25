@@ -166,6 +166,46 @@ def index_Tensor(args, kwargs) -> List[Optional[int]]:  # noqa: C901
     return out_sizes
 
 
+@register_upper_bound_inference(exir_ops.edge.aten.arange.default)
+@register_upper_bound_inference(torch.ops.aten.arange.default)
+def arange_default(args, kwargs) -> List[Optional[int]]:
+    end = args[0]
+    upper = eval_upper_bound(end)
+    if isinstance(upper, int):
+        return [max(upper, 0)]
+    return [upper]
+
+
+@register_upper_bound_inference(exir_ops.edge.aten.arange.start_step)
+@register_upper_bound_inference(torch.ops.aten.arange.start_step)
+def arange_start_step(args, kwargs) -> List[Optional[int]]:
+    start, end = args[0], args[1]
+    step = args[2] if len(args) > 2 else 1
+    try:
+        if isinstance(step, int) and step > 0:
+            upper = eval_upper_bound((end - start + step - 1) // step)
+        elif isinstance(step, int) and step < 0:
+            upper = eval_upper_bound((start - end - step - 1) // (-step))
+        else:
+            upper = eval_upper_bound((end - start) / step)
+    except Exception:
+        upper = None
+    if isinstance(upper, int):
+        return [max(upper, 0)]
+    return [upper]
+
+
+def _contiguous_stride(shape: List[int]) -> List[int]:
+    if len(shape) == 0:
+        return []
+    stride = [0] * len(shape)
+    running = 1
+    for i in range(len(shape) - 1, -1, -1):
+        stride[i] = running
+        running *= max(shape[i], 1)
+    return stride
+
+
 @deprecated(
     "`HintBasedSymShapeEvalPass` is deprecated "
     "and will be removed in a future version of ExecuTorch. "
@@ -228,9 +268,10 @@ class HintBasedSymShapeEvalPass(PassBase):
                                         _value_range = shape_env.var_to_range[  # pyre-fixme[16] `Optional` has no attribute `var_to_range`.
                                             v._sympy_()  # pyre-fixme[16] Undefined attribute: `int` has no attribute `_sympy_`.
                                         ]
-                                        # cannot handle unbounded, unbacked symints; add a range to bound it.
-                                        assert _value_range.upper is not int_oo
-                                        concrete_shape[i] = int(_value_range.upper)
+                                        if _value_range.upper is int_oo:
+                                            concrete_shape[i] = eval_expr(v)
+                                        else:
+                                            concrete_shape[i] = int(_value_range.upper)
                                 for i, v in enumerate(spec.stride):
                                     if concrete_spec[i] is None:
                                         _expr = (
@@ -242,13 +283,48 @@ class HintBasedSymShapeEvalPass(PassBase):
                                         )
 
                                         _bound_sympy = bound_sympy(_expr, _value_range)
-                                        # cannot handle unbounded, unbacked symints; add a range to bound it.
-                                        assert _bound_sympy.upper is not int_oo
-                                        concrete_spec[i] = int(_bound_sympy.upper)
+                                        if _bound_sympy.upper is int_oo:
+                                            concrete_spec[i] = eval_expr(v)
+                                        else:
+                                            concrete_spec[i] = int(_bound_sympy.upper)
 
-                        assert all(isinstance(s, int) for s in concrete_shape) and all(
-                            isinstance(s, int) for s in concrete_spec
-                        )
+                        if any(not isinstance(s, int) for s in concrete_shape) or any(
+                            not isinstance(s, int) for s in concrete_spec
+                        ):
+                            meta_tensors = [
+                                value
+                                for value in pytree.tree_flatten(
+                                    node.meta.get("val", [])
+                                )[0]
+                                if isinstance(value, torch.Tensor)
+                            ]
+                            if len(meta_tensors) == 1:
+                                concrete_shape = list(meta_tensors[0].shape)
+                                concrete_spec = list(meta_tensors[0].stride())
+                        if any(not isinstance(s, int) for s in concrete_shape) or any(
+                            not isinstance(s, int) for s in concrete_spec
+                        ):
+                            inference = upper_bound_shape_inference_table.get(
+                                node.target
+                            )
+                            if inference is not None:
+                                inferred_shape = inference(node.args, node.kwargs)
+                                if all(isinstance(s, int) for s in inferred_shape):
+                                    concrete_shape = inferred_shape
+                                    concrete_spec = _contiguous_stride(
+                                        concrete_shape
+                                    )
+
+                        if not (
+                            all(isinstance(s, int) for s in concrete_shape)
+                            and all(isinstance(s, int) for s in concrete_spec)
+                        ):
+                            raise RuntimeError(
+                                "HintBasedSymShapeEvalPass could not concretize tensor spec "
+                                f"for node {node.name} target={node.target}. "
+                                f"spec={spec}, concrete_shape={concrete_shape}, concrete_stride={concrete_spec}, "
+                                f"meta_val={node.meta.get('val')}"
+                            )
                         spec.shape = concrete_shape
                         spec.stride = concrete_spec
         return PassResult(graph_module, True)

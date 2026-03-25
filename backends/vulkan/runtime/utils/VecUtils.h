@@ -364,6 +364,10 @@ inline T val_at(const int64_t index, const std::vector<T>& sizes) {
 inline ivec2 make_ivec2(
     const std::vector<int64_t>& ints,
     bool reverse = false) {
+  if (ints.size() == 1) {
+    const auto value = safe_downcast<int32_t>(ints[0]);
+    return {value, value};
+  }
   VK_CHECK_COND(ints.size() == 2);
   if (reverse) {
     return {safe_downcast<int32_t>(ints[1]), safe_downcast<int32_t>(ints[0])};

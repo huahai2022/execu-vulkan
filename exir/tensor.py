@@ -100,6 +100,17 @@ def dim_order_from_stride(stride: Tuple[int]) -> Tuple[bytes]:
     return tuple(typing.cast(Tuple[bytes], sorted_dims))
 
 
+def canonical_dim_order(ndim: int) -> Tuple[bytes]:
+    return tuple(typing.cast(Tuple[bytes], tuple(range(ndim))))
+
+
+def safe_dim_order_from_stride(stride: Tuple[int], ndim: int) -> Tuple[bytes]:
+    try:
+        return dim_order_from_stride(stride)
+    except torch.fx.experimental.symbolic_shapes.GuardOnDataDependentSymNode:
+        return canonical_dim_order(ndim)
+
+
 def stride_from_dim_order(sizes: List[int], dim_order: List[int]) -> List[int]:
     """
     Converts dim order to stride using sizes
@@ -165,7 +176,9 @@ class TensorSpec:
         # convert to list making it easier to handle type checking
         self.shape: List[int] = list(shape)
         self.stride: Tuple[int] = contiguous_stride_from_shape(shape)
-        self.dim_order: Tuple[bytes] = dim_order_from_stride(self.stride)
+        self.dim_order: Tuple[bytes] = safe_dim_order_from_stride(
+            self.stride, len(self.shape)
+        )
         self.requires_grad = requires_grad
         self.layout = layout
         self.is_sparse = is_sparse
@@ -201,8 +214,12 @@ class TensorSpec:
             const=const,
             is_sparse=tensor.is_sparse,
         )
-        spec.stride = tensor.stride()
-        spec.dim_order = dim_order_from_stride(spec.stride)
+        try:
+            spec.stride = tensor.stride()
+            spec.dim_order = safe_dim_order_from_stride(spec.stride, len(spec.shape))
+        except torch.fx.experimental.symbolic_shapes.GuardOnDataDependentSymNode:
+            spec.stride = contiguous_stride_from_shape(tensor.shape)
+            spec.dim_order = safe_dim_order_from_stride(spec.stride, len(spec.shape))
         spec.requires_grad = tensor.requires_grad
         spec.storage = tensor.untyped_storage() if const else None
 

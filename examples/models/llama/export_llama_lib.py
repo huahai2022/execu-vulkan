@@ -112,6 +112,7 @@ EXECUTORCH_DEFINED_MODELS = [
     "qwen3_5_4b",
     "phi_4_mini",
     "smollm2",
+    "smolvlm_500m_instruct",
     "lfm2_350m",  # hybrid
     "lfm2_700m",  # hybrid
     "lfm2_1_2b",  # hybrid
@@ -124,6 +125,7 @@ HUGGING_FACE_REPO_IDS = {
     "qwen2_5_coder_32b": "Qwen/Qwen2.5-Coder-32B-Instruct",
     "phi_4_mini": "microsoft/Phi-4-mini-instruct",
     "smollm2": "HuggingFaceTB/SmolLM-135M",
+    "smolvlm_500m_instruct": "HuggingFaceTB/SmolVLM-500M-Instruct",
     "qwen3_0_6b": "Qwen/Qwen3-0.6B",
     "qwen3_1_7b": "Qwen/Qwen3-1.7B",
     "qwen3_4b": "Qwen/Qwen3-4B",
@@ -659,6 +661,8 @@ def export_llama(  # noqa: C901
             from executorch.examples.models.phi_4_mini import convert_weights
         elif model_name == "smollm2":
             from executorch.examples.models.smollm2 import convert_weights
+        elif model_name == "smolvlm_500m_instruct":
+            from executorch.examples.models.smolvlm import convert_weights
         elif model_name.startswith("lfm2"):
             from executorch.examples.models.lfm2 import convert_weights
         else:
@@ -1516,8 +1520,12 @@ def _load_llama_model(llm_config: LlmConfig) -> "LLMEdgeManager":
 
     modelname = llm_config.base.model_class.value
     if modelname in EXECUTORCH_DEFINED_MODELS:
-        module_name = "llama"
-        model_class_name = "Llama2Model"  # TODO: Change to "LlamaModel" in examples/models/llama/model.py.
+        if modelname == "smolvlm_500m_instruct":
+            module_name = "smolvlm"
+            model_class_name = "SmolVLMModel"
+        else:
+            module_name = "llama"
+            model_class_name = "Llama2Model"  # TODO: Change to "LlamaModel" in examples/models/llama/model.py.
     elif modelname in TORCHTUNE_DEFINED_MODELS:
         if modelname == "llama3_2_vision":
             module_name = "llama3_2_vision"

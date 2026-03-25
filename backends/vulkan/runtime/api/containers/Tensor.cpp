@@ -9,6 +9,7 @@
 #include <executorch/backends/vulkan/runtime/api/containers/Tensor.h>
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
 #include <cstring>
 
 namespace vkcompute {
@@ -1326,17 +1327,40 @@ void vTensor::update_metadata() {
 }
 
 void vTensor::check_sizes(const std::vector<int64_t>& sizes) const {
+  const std::vector<int64_t> new_padded_sizes =
+      calculate_padded_sizes(sizes, packed_dim_info_);
   if (storage_type() != utils::kBuffer) {
     // For texture storage check that the current texture is large enough for
     // the new sizes of the tensor.
     utils::uvec3 virtual_extents = calculate_image_extents(
-        dtype_, packed_dim_info_, padded_sizes_, axis_map_);
+        dtype_, packed_dim_info_, new_padded_sizes, axis_map_);
 
     bool valid_resize = virtual_extents[0] <= storage_->image_extents_[0];
     valid_resize =
         valid_resize && virtual_extents[1] <= storage_->image_extents_[1];
     valid_resize =
         valid_resize && virtual_extents[2] <= storage_->image_extents_[2];
+
+    if (!valid_resize) {
+      std::fprintf(
+          stderr,
+          "vTensor::check_sizes texture resize failure sizes=[%lld,%lld,%lld,%lld] padded=[%lld,%lld,%lld,%lld] extents=[%u,%u,%u] need=[%u,%u,%u] storage_type=%d\n",
+          static_cast<long long>(sizes.size() > 0 ? sizes[0] : -1),
+          static_cast<long long>(sizes.size() > 1 ? sizes[1] : -1),
+          static_cast<long long>(sizes.size() > 2 ? sizes[2] : -1),
+          static_cast<long long>(sizes.size() > 3 ? sizes[3] : -1),
+          static_cast<long long>(new_padded_sizes.size() > 0 ? new_padded_sizes[0] : -1),
+          static_cast<long long>(new_padded_sizes.size() > 1 ? new_padded_sizes[1] : -1),
+          static_cast<long long>(new_padded_sizes.size() > 2 ? new_padded_sizes[2] : -1),
+          static_cast<long long>(new_padded_sizes.size() > 3 ? new_padded_sizes[3] : -1),
+          storage_->image_extents_[0],
+          storage_->image_extents_[1],
+          storage_->image_extents_[2],
+          virtual_extents[0],
+          virtual_extents[1],
+          virtual_extents[2],
+          static_cast<int>(storage_type()));
+    }
 
     VK_CHECK_COND(
         valid_resize,
@@ -1345,7 +1369,7 @@ void vTensor::check_sizes(const std::vector<int64_t>& sizes) const {
     // For buffer storage check that the current buffer is large enough for
     // the new sizes of the tensor.
     int64_t gpu_buffer_numel =
-        calculate_gpu_buffer_numel(dtype_, padded_sizes_);
+        calculate_gpu_buffer_numel(dtype_, new_padded_sizes);
     bool valid_resize =
         gpu_buffer_numel + storage_->buffer_offset_ <= storage_->buffer_length_;
     VK_CHECK_COND(
@@ -1392,9 +1416,31 @@ void vTensor::virtual_resize(const std::vector<int64_t>& new_sizes) {
       new_sizes.size() == dim_order_.size(),
       "new sizes cannot modify the dimensionality of the tensor ");
 
+  const std::vector<int64_t> new_padded_sizes =
+      calculate_padded_sizes(new_sizes, packed_dim_info_);
+  if (storage_type() != utils::kBuffer) {
+    const utils::uvec3 new_image_extents = calculate_image_extents(
+        dtype_, packed_dim_info_, new_padded_sizes, axis_map_);
+    const bool needs_reallocation =
+        new_image_extents[0] > storage_->image_extents_[0] ||
+        new_image_extents[1] > storage_->image_extents_[1] ||
+        new_image_extents[2] > storage_->image_extents_[2];
+    if (needs_reallocation) {
+      storage_ = std::make_shared<vTensorStorage>(
+          storage_->context_,
+          storage_type(),
+          axis_map_,
+          packed_dim_info_,
+          new_padded_sizes,
+          dtype_,
+          calculate_gpu_buffer_numel(dtype_, new_padded_sizes),
+          storage_->image_.has_memory());
+    }
+  }
+
   check_sizes(new_sizes);
   sizes_ = new_sizes;
-  padded_sizes_ = calculate_padded_sizes(sizes_, packed_dim_info_);
+  padded_sizes_ = new_padded_sizes;
   update_metadata();
 }
 

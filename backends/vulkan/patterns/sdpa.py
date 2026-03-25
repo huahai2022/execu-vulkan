@@ -31,6 +31,19 @@ def is_sdpa_with_kv_cache_node(node: Any) -> bool:
     return utils.node_has_target(node, "llama::sdpa_with_kv_cache")
 
 
+def unwrap_cache_view(node: Any) -> Any:
+    current = node
+    if isinstance(current, torch.fx.Node) and utils.node_has_target(
+        current, "aten::to.dtype"
+    ):
+        current = current.args[0]
+    if isinstance(current, torch.fx.Node) and utils.node_has_target(
+        current, "aten::transpose.int"
+    ):
+        current = current.args[0]
+    return current
+
+
 class CausalSDPAMatch(PatternMatch):
     def __init__(self, custom_sdpa_node: torch.fx.Node) -> None:
         self.anchor_node = custom_sdpa_node
@@ -43,8 +56,8 @@ class CausalSDPAMatch(PatternMatch):
             return
 
         self.query_node = custom_sdpa_node.args[0]
-        self.key_cache_node = custom_sdpa_node.args[1]
-        self.value_cache_node = custom_sdpa_node.args[2]
+        self.key_cache_node = unwrap_cache_view(custom_sdpa_node.args[1])
+        self.value_cache_node = unwrap_cache_view(custom_sdpa_node.args[2])
         self.start_pos_node = custom_sdpa_node.args[3]
         self.attn_mask_node = custom_sdpa_node.args[4]
         self.dropout_p_node = custom_sdpa_node.args[5]
@@ -77,9 +90,13 @@ class CausalSDPAMatch(PatternMatch):
             self.value_projection_node = self.update_value_cache_node.args[0]
 
         # We have additional optional arguments but we don't need to capture them
-        # since the new op doesn't use them
-
-        self.match_found = True
+        # since the new op doesn't use them. Only mark the pattern as matched when
+        # both cache update ops are present; otherwise leave the graph as separate
+        # update_cache/custom_sdpa ops, which Vulkan can lower directly.
+        self.match_found = (
+            self.update_key_cache_node is not None
+            and self.update_value_cache_node is not None
+        )
 
 
 @register_pattern_detector("causal_sdpa")

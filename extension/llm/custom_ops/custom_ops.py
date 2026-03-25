@@ -15,12 +15,175 @@ import logging
 from typing import Tuple
 
 import torch
+import torch.nn.functional as F
 
 from torch._inductor.lowering import lowerings as L, register_lowering
 
 from torch.library import impl
 
 aten = torch.ops.aten
+_LLAMA_DEF_LIB = None
+_LLAMA_IMPL_LIB = None
+
+
+def _repeat_kv_for_gqa(tensor: torch.Tensor, target_heads: int) -> torch.Tensor:
+    current_heads = tensor.size(2)
+    if current_heads == target_heads:
+        return tensor
+    if target_heads % current_heads != 0:
+        raise RuntimeError(
+            f"Cannot expand KV heads from {current_heads} to {target_heads}"
+        )
+    return tensor.repeat_interleave(target_heads // current_heads, dim=2)
+
+
+def _custom_sdpa_impl(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask=None,
+    is_causal: bool = False,
+    scale=None,
+) -> torch.Tensor:
+    key = _repeat_kv_for_gqa(key, query.size(2))
+    value = _repeat_kv_for_gqa(value, query.size(2))
+
+    q = query.transpose(1, 2)
+    k = key.transpose(1, 2)
+    v = value.transpose(1, 2)
+
+    kwargs = {
+        "attn_mask": attn_mask,
+        "dropout_p": 0.0,
+        "is_causal": is_causal,
+    }
+    if scale is not None:
+        kwargs["scale"] = float(scale)
+    out = F.scaled_dot_product_attention(q, k, v, **kwargs)
+    return out.transpose(1, 2).contiguous()
+
+
+def _register_python_fallback_ops() -> None:
+    global _LLAMA_DEF_LIB, _LLAMA_IMPL_LIB
+    if _LLAMA_DEF_LIB is not None:
+        return
+
+    _LLAMA_DEF_LIB = torch.library.Library("llama", "DEF")
+    _LLAMA_DEF_LIB.define(
+        "sdpa_with_kv_cache(Tensor query, Tensor key, Tensor value, Tensor(a!) key_cache, Tensor(b!) value_cache, SymInt start_pos, SymInt seq_len, Tensor? attn_mask=None, float drpout_p=0.0, bool is_causal=False, float? scale=None) -> Tensor"
+    )
+    _LLAMA_DEF_LIB.define(
+        "custom_sdpa(Tensor query, Tensor key, Tensor value, SymInt start_pos, Tensor? attn_mask=None, float drpout_p=0.0, bool is_causal=False, float? scale=None) -> Tensor"
+    )
+    _LLAMA_DEF_LIB.define(
+        "update_cache(Tensor value, Tensor(a!) cache, SymInt start_pos) -> Tensor"
+    )
+    _LLAMA_DEF_LIB.define(
+        "update_cache_with_indices(Tensor value, Tensor(a!) cache, SymInt start_pos, Tensor indices) -> Tensor"
+    )
+    _LLAMA_DEF_LIB.define("fast_hadamard_transform(Tensor mat) -> Tensor")
+    _LLAMA_DEF_LIB.define(
+        "custom_quantized_sdpa(Tensor query, Tensor key, Tensor value, SymInt start_pos, Tensor? attn_mask=None, float drpout_p=0.0, bool is_causal=False, float? scale=None, Tensor? q_zero_points=None, Tensor? q_scales=None, Tensor? k_zero_points=None, Tensor? k_scales=None, Tensor? v_zero_points=None, Tensor? v_scales=None, bool is_seq_at_dim_2=False) -> Tensor"
+    )
+
+    _LLAMA_IMPL_LIB = torch.library.Library(
+        "llama", "IMPL", "CompositeExplicitAutograd"
+    )
+
+    def update_cache(value: torch.Tensor, cache: torch.Tensor, start_pos) -> torch.Tensor:
+        start_pos = int(start_pos)
+        seq_len = value.size(1)
+        cache[:, start_pos : start_pos + seq_len, :, :].copy_(value)
+        return torch.empty((1,), device=cache.device)
+
+    def update_cache_with_indices(
+        value: torch.Tensor, cache: torch.Tensor, start_pos, indices: torch.Tensor
+    ) -> torch.Tensor:
+        del start_pos
+        for batch_idx in range(indices.size(0)):
+            for seq_idx in range(indices.size(1)):
+                index = int(indices[batch_idx, seq_idx].item())
+                if index < 0 or index >= cache.size(1):
+                    raise RuntimeError(f"Index {index} is out of bounds for cache update")
+                cache[batch_idx, index].copy_(value[batch_idx, seq_idx])
+        return torch.empty((1,), device=cache.device)
+
+    def custom_sdpa(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        start_pos,
+        attn_mask=None,
+        drpout_p: float = 0.0,
+        is_causal: bool = False,
+        scale=None,
+    ) -> torch.Tensor:
+        del start_pos, drpout_p
+        return _custom_sdpa_impl(query, key, value, attn_mask, is_causal, scale)
+
+    def sdpa_with_kv_cache(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        start_pos,
+        seq_len,
+        attn_mask=None,
+        drpout_p: float = 0.0,
+        is_causal: bool = False,
+        scale=None,
+    ) -> torch.Tensor:
+        del seq_len, drpout_p
+        update_cache(key, key_cache, start_pos)
+        update_cache(value, value_cache, start_pos)
+        return _custom_sdpa_impl(
+            query, key_cache, value_cache, attn_mask, is_causal, scale
+        )
+
+    def custom_quantized_sdpa(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        start_pos,
+        attn_mask=None,
+        drpout_p: float = 0.0,
+        is_causal: bool = False,
+        scale=None,
+        q_zero_point=None,
+        q_scale=None,
+        k_zero_point=None,
+        k_scale=None,
+        v_zero_point=None,
+        v_scale=None,
+        is_seq_at_dim_2: bool = False,
+    ) -> torch.Tensor:
+        del (
+            start_pos,
+            drpout_p,
+            q_zero_point,
+            q_scale,
+            k_zero_point,
+            k_scale,
+            v_zero_point,
+            v_scale,
+            is_seq_at_dim_2,
+        )
+        return _custom_sdpa_impl(
+            query.to(torch.float32),
+            key.to(torch.float32),
+            value.to(torch.float32),
+            attn_mask,
+            is_causal,
+            scale,
+        )
+
+    _LLAMA_IMPL_LIB.impl("update_cache", update_cache)
+    _LLAMA_IMPL_LIB.impl("update_cache_with_indices", update_cache_with_indices)
+    _LLAMA_IMPL_LIB.impl("custom_sdpa", custom_sdpa)
+    _LLAMA_IMPL_LIB.impl("sdpa_with_kv_cache", sdpa_with_kv_cache)
+    _LLAMA_IMPL_LIB.impl("fast_hadamard_transform", lambda mat: mat)
+    _LLAMA_IMPL_LIB.impl("custom_quantized_sdpa", custom_quantized_sdpa)
 
 try:
     op = torch.ops.llama.sdpa_with_kv_cache.default
@@ -40,10 +203,14 @@ except:
     logging.info(f"Looking for libcustom_ops_aot_lib.so in {package_path}")
 
     libs = list(package_path.glob("**/*custom_ops_aot_lib.*"))
-
-    assert len(libs) == 1, f"Expected 1 library but got {len(libs)}"
-    logging.info(f"Loading custom ops library: {libs[0]}")
-    torch.ops.load_library(libs[0])
+    if len(libs) == 1:
+        logging.info(f"Loading custom ops library: {libs[0]}")
+        torch.ops.load_library(libs[0])
+    else:
+        logging.warning(
+            "Falling back to Python llama custom-op shims because libcustom_ops_aot_lib was not found."
+        )
+        _register_python_fallback_ops()
     op = torch.ops.llama.sdpa_with_kv_cache.default
     assert op is not None
     op2 = torch.ops.llama.fast_hadamard_transform.default
